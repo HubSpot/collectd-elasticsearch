@@ -17,11 +17,17 @@
 import collections
 import json
 import urllib2
+import socket
+import httplib
 
 PREFIX = "elasticsearch"
 ES_CLUSTER = "elasticsearch"
 ES_HOST = "localhost"
 ES_PORT = 9200
+ES_URL_SCHEME = "http"
+ES_HTTP_TLS_ENABLED = False
+ES_TLS_CERT_PATH = ""
+ES_TLS_KEY_PATH = ""
 ES_VERSION = None
 
 ENABLE_INDEX_STATS = True
@@ -496,8 +502,8 @@ def read_callback():
 
 def configure_callback(conf):
     """called by collectd to configure the plugin. This is called only once"""
-    global ES_HOST, ES_PORT, ES_NODE_URL, ES_VERSION, VERBOSE_LOGGING, \
-        ES_CLUSTER, \
+    global ES_HOST, ES_PORT, ES_NODE_URL, ES_URL_SCHEME, ES_HTTP_TLS_ENABLED, ES_TLS_CERT_PATH, \
+        ES_TLS_KEY_PATH, ES_VERSION, VERBOSE_LOGGING, ES_CLUSTER, \
         ES_INDEX, ENABLE_INDEX_STATS, ENABLE_CLUSTER_STATS, COLLECTION_INTERVAL
     for node in conf.children:
         if node.key == 'Host':
@@ -520,6 +526,15 @@ def configure_callback(conf):
             ENABLE_CLUSTER_STATS = bool(node.values[0])
         elif node.key == 'Interval':
             COLLECTION_INTERVAL = int(node.values[0])
+        elif node.key == 'HttpTlsEnabled':
+            if bool(node.values[0]):
+                ES_URL_SCHEME = "https"
+                ES_HTTP_TLS_ENABLED = True
+                ES_HOST = socket.getfqdn()
+        elif node.key == 'TlsCertFile':
+            ES_TLS_CERT_PATH = node.values[0]
+        elif node.key == 'TlsKeyFile':
+            ES_TLS_KEY_PATH = node.values[0]
         else:
             collectd.warning('elasticsearch plugin: Unknown config key: %s.'
                              % node.key)
@@ -539,10 +554,10 @@ def configure_callback(conf):
 
 # helper methods
 def init_stats():
-    global ES_HOST, ES_PORT, ES_NODE_URL, ES_CLUSTER_URL, ES_INDEX_URL, \
+    global ES_HOST, ES_PORT, ES_NODE_URL, ES_URL_SCHEME, ES_CLUSTER_URL, ES_INDEX_URL, \
         ES_VERSION, VERBOSE_LOGGING, NODE_STATS_CUR, INDEX_STATS_CUR, \
         CLUSTER_STATS_CUR, ENABLE_INDEX_STATS, ENABLE_CLUSTER_STATS
-    ES_NODE_URL = "http://" + ES_HOST + ":" + str(ES_PORT) + \
+    ES_NODE_URL = ES_URL_SCHEME + "://" + ES_HOST + ":" + str(ES_PORT) + \
                   "/_nodes/_local/stats/transport,http,process,jvm,indices," \
                   "thread_pool"
     NODE_STATS_CUR = dict(NODE_STATS.items())
@@ -560,10 +575,10 @@ def init_stats():
     # version agnostic settings
     if not ES_INDEX:
         # get all index stats
-        ES_INDEX_URL = "http://" + ES_HOST + \
+        ES_INDEX_URL = ES_URL_SCHEME + "://" + ES_HOST + \
                        ":" + str(ES_PORT) + "/_all/_stats"
     else:
-        ES_INDEX_URL = "http://" + ES_HOST + ":" + \
+        ES_INDEX_URL = ES_URL_SCHEME + "://" + ES_HOST + ":" + \
                        str(ES_PORT) + "/" + ",".join(ES_INDEX) + "/_stats"
     #common thread pools for all ES versions
     thread_pools = ['generic', 'index', 'get', 'snapshot', 'bulk', 'warmer', 'flush', 'search', 'refresh']
@@ -583,7 +598,7 @@ def init_stats():
             path = 'thread_pool.{0}.{1}'.format(pool, attr)
             NODE_STATS_CUR[path] = Stat("counter", 'nodes.%s.{0}'.format(path))
 
-    ES_CLUSTER_URL = "http://" + ES_HOST + \
+    ES_CLUSTER_URL = ES_URL_SCHEME + "://" + ES_HOST + \
                      ":" + str(ES_PORT) + "/_cluster/health"
 
     log_verbose('Configured with version=%s, host=%s, port=%s, url=%s' %
@@ -628,10 +643,29 @@ def fetch_stats():
                 parse_index_stats(indexes_json_stats[index_name], index_name)
 
 
+# SSL requests wrapper
+class HTTPSClientAuthHandler(urllib2.HTTPSHandler):
+    def __init__(self, key_file, cert_file):
+        urllib2.HTTPSHandler.__init__(self)
+        self.key_file = key_file
+        self.cert_file = cert_file
+
+    def https_open(self, req):
+        return self.do_open(self.get_connection, req)
+
+    def get_connection(self, host, timeout=300):
+        return httplib.HTTPSConnection(host, key_file=self.key_file, cert_file=self.cert_file, timeout=timeout)
+
+
 def fetch_url(url):
     response = None
     try:
-        response = urllib2.urlopen(url, timeout=10)
+        if ES_HTTP_TLS_ENABLED:
+            opener = urllib2.build_opener(HTTPSClientAuthHandler(ES_TLS_KEY_PATH, ES_TLS_CERT_PATH))
+            response = opener.open(url, timeout=10)
+            opener.close()
+        else:
+            response = urllib2.urlopen(url, timeout=10)
         return json.load(response)
     except urllib2.URLError, e:
         collectd.error(
@@ -645,7 +679,7 @@ def fetch_url(url):
 def load_es_version():
     global ES_VERSION
     if ES_VERSION is None:
-        json = fetch_url("http://" + ES_HOST + ":" + str(ES_PORT))
+        json = fetch_url(ES_URL_SCHEME + "://" + ES_HOST + ":" + str(ES_PORT))
         if json is None:
             ES_VERSION = "1.0.0"
             collectd.warning("elasticsearch plugin: unable to determine " +
