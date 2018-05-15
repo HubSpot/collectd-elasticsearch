@@ -23,8 +23,10 @@ import httplib
 PREFIX = "elasticsearch"
 ES_CLUSTER = "elasticsearch"
 ES_HOST = "localhost"
+ES_AUTH_HOST = socket.getfqdn()
 ES_PORT = 9200
 ES_URL_SCHEME = "http"
+ES_AUTH_URL_SCHEME = "https"
 ES_HTTP_TLS_ENABLED = False
 ES_TLS_CERT_PATH = ""
 ES_TLS_KEY_PATH = ""
@@ -49,6 +51,21 @@ CLUSTER_STATS_CUR = {}
 COLLECTION_INTERVAL = 10
 
 CLUSTER_STATUS = {'green': 0, 'yellow': 1, 'red': 2}
+
+
+# Class to store an es url
+# allows generating between https auth and http non-auth urls easily
+# url_suffix is after the port in the url, for example in 'localhost:9200/_cat/nodes' would be '/_cat/nodes'
+class ElasticsearchRequestUrl(object):
+    def __init__(self, url_suffix):
+        self.url_suffix = url_suffix
+
+    def get_auth_url(self):
+        return ES_AUTH_URL_SCHEME + "://" + ES_AUTH_HOST + ":" + str(ES_PORT) + self.url_suffix
+
+    def get_non_auth_url(self):
+        return ES_URL_SCHEME + "://" + ES_HOST + ":" + str(ES_PORT) + self.url_suffix
+
 
 # DICT: ElasticSearch 1.0.0
 NODE_STATS = {
@@ -502,7 +519,7 @@ def read_callback():
 
 def configure_callback(conf):
     """called by collectd to configure the plugin. This is called only once"""
-    global ES_HOST, ES_PORT, ES_NODE_URL, ES_URL_SCHEME, ES_HTTP_TLS_ENABLED, ES_TLS_CERT_PATH, \
+    global ES_HOST, ES_PORT, ES_NODE_URL, ES_HTTP_TLS_ENABLED, ES_TLS_CERT_PATH, \
         ES_TLS_KEY_PATH, ES_VERSION, VERBOSE_LOGGING, ES_CLUSTER, \
         ES_INDEX, ENABLE_INDEX_STATS, ENABLE_CLUSTER_STATS, COLLECTION_INTERVAL
     for node in conf.children:
@@ -528,9 +545,7 @@ def configure_callback(conf):
             COLLECTION_INTERVAL = int(node.values[0])
         elif node.key == 'HttpTlsEnabled':
             if bool(node.values[0]):
-                ES_URL_SCHEME = "https"
                 ES_HTTP_TLS_ENABLED = True
-                ES_HOST = socket.getfqdn()
         elif node.key == 'TlsCertFile':
             ES_TLS_CERT_PATH = node.values[0]
         elif node.key == 'TlsKeyFile':
@@ -557,9 +572,7 @@ def init_stats():
     global ES_HOST, ES_PORT, ES_NODE_URL, ES_URL_SCHEME, ES_CLUSTER_URL, ES_INDEX_URL, \
         ES_VERSION, VERBOSE_LOGGING, NODE_STATS_CUR, INDEX_STATS_CUR, \
         CLUSTER_STATS_CUR, ENABLE_INDEX_STATS, ENABLE_CLUSTER_STATS
-    ES_NODE_URL = ES_URL_SCHEME + "://" + ES_HOST + ":" + str(ES_PORT) + \
-                  "/_nodes/_local/stats/transport,http,process,jvm,indices," \
-                  "thread_pool"
+    ES_NODE_URL = ElasticsearchRequestUrl("/_nodes/_local/stats/transport,http,process,jvm,indices,thread_pool")
     NODE_STATS_CUR = dict(NODE_STATS.items())
     INDEX_STATS_CUR = dict(INDEX_STATS.items())
     if ES_VERSION.startswith("2."):
@@ -575,11 +588,11 @@ def init_stats():
     # version agnostic settings
     if not ES_INDEX:
         # get all index stats
-        ES_INDEX_URL = ES_URL_SCHEME + "://" + ES_HOST + \
-                       ":" + str(ES_PORT) + "/_all/_stats"
+        ES_INDEX_URL = ElasticsearchRequestUrl("/_all/_stats")
     else:
-        ES_INDEX_URL = ES_URL_SCHEME + "://" + ES_HOST + ":" + \
-                       str(ES_PORT) + "/" + ",".join(ES_INDEX) + "/_stats"
+        url_suffix = "/" + ",".join(ES_INDEX) + "/_stats"
+        ES_INDEX_URL = ElasticsearchRequestUrl(url_suffix)
+
     #common thread pools for all ES versions
     thread_pools = ['generic', 'index', 'get', 'snapshot', 'bulk', 'warmer', 'flush', 'search', 'refresh']
 
@@ -598,8 +611,7 @@ def init_stats():
             path = 'thread_pool.{0}.{1}'.format(pool, attr)
             NODE_STATS_CUR[path] = Stat("counter", 'nodes.%s.{0}'.format(path))
 
-    ES_CLUSTER_URL = ES_URL_SCHEME + "://" + ES_HOST + \
-                     ":" + str(ES_PORT) + "/_cluster/health"
+    ES_CLUSTER_URL = ElasticsearchRequestUrl("/_cluster/health")
 
     log_verbose('Configured with version=%s, host=%s, port=%s, url=%s' %
                 (ES_VERSION, ES_HOST, ES_PORT, ES_NODE_URL))
@@ -653,33 +665,48 @@ class HTTPSClientAuthHandler(urllib2.HTTPSHandler):
     def https_open(self, req):
         return self.do_open(self.get_connection, req)
 
-    def get_connection(self, host, timeout=300):
+    def get_connection(self, host, timeout=10):
         return httplib.HTTPSConnection(host, key_file=self.key_file, cert_file=self.cert_file, timeout=timeout)
 
 
-def fetch_url(url):
-    response = None
-    try:
-        if ES_HTTP_TLS_ENABLED:
+def fetch_url(es_url):
+    # If tls is enabled, try doing an http request, but catch an exception so we can attempt a non-tls request
+    # This is needed for migrating a cluster from http->https as tls will be enabled on some nodes that are running
+    # es without authenticated http requests
+    tls_request_error = None
+    tls_response = None
+    non_tls_response = None
+    if ES_HTTP_TLS_ENABLED:
+        try:
             opener = urllib2.build_opener(HTTPSClientAuthHandler(ES_TLS_KEY_PATH, ES_TLS_CERT_PATH))
-            response = opener.open(url, timeout=10)
-            opener.close()
-        else:
-            response = urllib2.urlopen(url, timeout=10)
-        return json.load(response)
+            tls_response = opener.open(es_url.get_auth_url(), timeout=10)
+            return json.load(tls_response)
+        except urllib2.URLError, e:
+            # If the https request failed, catch the error but store for future logging
+            tls_request_error = e
+        finally:
+            if tls_response is not None:
+                tls_response.close()
+    try:
+        non_tls_response = urllib2.urlopen(es_url.get_non_auth_url(), timeout=10)
+        return json.load(non_tls_response)
     except urllib2.URLError, e:
-        collectd.error(
-            'elasticsearch plugin: Error connecting to %s - %r' % (url, e))
+        if tls_request_error is not None:
+             collectd.error(
+                 'elasticsearch plugin, error connecting to tls url: %s - %r, error connecting to non-tls url: %s - %r'
+                 % (es_url.get_auth_url(), tls_request_error, es_url.get_non_auth_url(), e))
+        else:
+            collectd.error('elasticsearch plugin: Error connecting to %s - %r' % (es_url.get_non_auth_url(), e))
         return None
     finally:
-        if response is not None:
-            response.close()
+        if non_tls_response is not None:
+            non_tls_response.close()
 
 
 def load_es_version():
     global ES_VERSION
     if ES_VERSION is None:
-        json = fetch_url(ES_URL_SCHEME + "://" + ES_HOST + ":" + str(ES_PORT))
+        json = fetch_url(ElasticsearchRequestUrl(''))
         if json is None:
             ES_VERSION = "1.0.0"
             collectd.warning("elasticsearch plugin: unable to determine " +
